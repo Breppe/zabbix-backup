@@ -64,6 +64,7 @@ GENERATIONSTOKEEP=0
 ZBX_CONFIG="/etc/zabbix/zabbix_server.conf"
 READ_ZBX_CONFIG="yes"
 HANDLE_UNKNOWN="fail"
+BANNER="no"
 
 #
 # Show version
@@ -166,6 +167,11 @@ OPTIONS
     -i
         Ingore unknown tables (don't include them into the backup)
 
+    -B
+        Print a detailed banner before processing: shows the database command
+        that will be run, all config paths that will be archived, output files,
+        compression and rotation settings.
+
     -q
         Quiet mode: no output except for errors (for batch/crontab use).
 
@@ -204,8 +210,9 @@ fi
 # PARSE COMMAND LINE ARGUMENTS
 #
 DB_GIVEN=0
-while getopts ":c:S:d:H:o:p:P:r:s:t:u:z:0nNCqxZfiv" opt; do
+while getopts ":Bc:S:d:H:o:p:P:r:s:t:u:z:0nNCqxZfiv" opt; do
     case $opt in
+        B)  BANNER="yes" ;;
         t)  DBTYPE="$OPTARG" ;;
         H)  ODBHOST="$OPTARG" ;;
         s)  ODBSOCKET="$OPTARG" ;;
@@ -385,6 +392,79 @@ EOF
     [ -n "$DBNAME" ]       && echo " - database: $DBNAME"
     [ -n "$DBUSER" ]       && echo " - user:     $DBUSER"
     [ -n "$DUMPDIR" ]      && echo " - output:   $DUMPDIR"
+fi
+
+#
+# BANNER
+#
+if [ "$BANNER" == "yes" ]; then
+    # Build a display-safe version of the DB connection options (password masked)
+    display_opts=()
+    for opt in "${DB_OPTS[@]}"; do
+        [[ "$opt" == -p* ]] && display_opts+=("-p***") || display_opts+=("$opt")
+    done
+
+    case $DBTYPE in
+        mysql) display_cmd="mysqldump ${display_opts[*]} --opt --single-transaction --skip-lock-tables $DBNAME" ;;
+        psql)  display_cmd="pg_dump   ${display_opts[*]} -d $DBNAME" ;;
+    esac
+
+    # Config dirs (check existence for each candidate)
+    zbx_candidates=(/etc/zabbix /etc/cron.d /etc/logrotate.d /etc/systemd/system)
+    web_candidates=(/etc/apache2 /etc/httpd /etc/nginx /etc/php)
+    db_candidates=(/etc/mysql /etc/my.cnf.d /etc/postgresql /etc/snmp /usr/share/snmp/mibs /var/lib/zabbix/mibs)
+
+    fmt_dirs() {
+        local out=""
+        for d in "$@"; do
+            if [ -d "$d" ]; then out+="  $d [found]\n"
+            else                  out+="  $d [not present]\n"
+            fi
+        done
+        printf "%b" "$out"
+    }
+
+    [ "$COMPRESSION" == "gz" ] && compress_label="gzip (.tar.gz)"
+    [ "$COMPRESSION" == "xz" ] && compress_label="xz   (.tar.xz)"
+    [ -z "$COMPRESSION"      ] && compress_label="none (.tar)"
+
+    [ $GENERATIONSTOKEEP -gt 0 ] && rotate_label="keep last $GENERATIONSTOKEEP" || rotate_label="keep all (no rotation)"
+
+    cat <<EOF
+
+================================================================================
+  zabbix-dump $VERSION — backup plan
+================================================================================
+
+  DATABASE
+    Type        : $DBTYPE
+EOF
+    [ -n "$DBHOST"       ] && echo "    Host        : $DBHOST ($DBHOSTNAME)"
+    [ -n "$DBSOCKET"     ] && echo "    Socket      : $DBSOCKET"
+    [ -n "$DBPORT"       ] && echo "    Port        : $DBPORT"
+    [ -n "$DBSCHEMA"     ] && echo "    Schema      : $DBSCHEMA"
+    [ -n "$DBNAME"       ] && echo "    Database    : $DBNAME"
+    [ -n "$DBUSER"       ] && echo "    User        : $DBUSER"
+    [ -n "$ZBX_CONFIG"   ] && echo "    Zabbix cfg  : $ZBX_CONFIG"
+    cat <<EOF
+    Output dir  : $DUMPDIR
+    Compression : $compress_label
+    Rotation    : $rotate_label
+    Command     : $display_cmd
+
+  FILESYSTEM CONFIG BACKUP
+
+    [zabbix]
+$(fmt_dirs "${zbx_candidates[@]}")
+    [webserver]
+$(fmt_dirs "${web_candidates[@]}")
+    [database]
+$(fmt_dirs "${db_candidates[@]}")
+    Manifest    : ${DUMPFILENAME_PREFIX}_<timestamp>_manifest.md
+
+================================================================================
+
+EOF
 fi
 
 #
@@ -620,11 +700,123 @@ fi
 [ "$QUIET" == "no" ] && echo "Backup Completed" && echo "${DUMPFILE}${SUFFIX}"
 
 #
-# ROTATE OLD BACKUPS
+# FILESYSTEM CONFIG BACKUP
+#
+# Three tarballs (zabbix / webserver / database) plus a manifest.md are created
+# alongside the DB dump. tar preserves full FS paths and symlinks by default;
+# extract to / on a replacement machine to restore configs in place.
+#
+if [ "$DUMPDIR" != "-" ]; then
+    CFG_TS="$(date +%Y%m%d-%H%M)"
+    CFG_BASE="${DUMPFILENAME_PREFIX}_${CFG_TS}${VERSION}"
+
+    case "$COMPRESSION" in
+        gz) TARF="czf"; TAREXT=".tar.gz" ;;
+        xz) TARF="cJf"; TAREXT=".tar.xz" ;;
+        *)  TARF="cf";  TAREXT=".tar"    ;;
+    esac
+
+    # Build directory lists — skip paths not present on this machine
+    zbx_dirs=(); for d in /etc/zabbix /etc/cron.d /etc/logrotate.d /etc/systemd/system; do
+        [ -d "$d" ] && zbx_dirs+=("$d"); done
+
+    web_dirs=(); for d in /etc/apache2 /etc/httpd /etc/nginx /etc/php; do
+        [ -d "$d" ] && web_dirs+=("$d"); done
+
+    db_dirs=(); for d in /etc/mysql /etc/my.cnf.d /etc/postgresql \
+                         /etc/snmp /usr/share/snmp/mibs /var/lib/zabbix/mibs; do
+        [ -d "$d" ] && db_dirs+=("$d"); done
+
+    [ "$QUIET" == "no" ] && echo $'\nBacking up filesystem configs...'
+
+    [ ${#zbx_dirs[@]} -gt 0 ] && tar "$TARF" "$DUMPDIR/${CFG_BASE}_configs_zabbix${TAREXT}"    "${zbx_dirs[@]}"
+    [ ${#web_dirs[@]} -gt 0 ] && tar "$TARF" "$DUMPDIR/${CFG_BASE}_configs_webserver${TAREXT}"  "${web_dirs[@]}"
+    [ ${#db_dirs[@]}  -gt 0 ] && tar "$TARF" "$DUMPDIR/${CFG_BASE}_configs_database${TAREXT}"   "${db_dirs[@]}"
+
+    # Manifest
+    {
+        echo "# Zabbix DR Manifest — $(date '+%Y-%m-%d %H:%M')"
+        echo ""
+        echo "| Field | Value |"
+        echo "|-------|-------|"
+        echo "| Host | $(hostname -f 2>/dev/null || hostname) |"
+        echo "| DB type / name | ${DBTYPE} / ${DBNAME} |"
+        echo "| Zabbix DB version | ${VERSION:-unknown} |"
+        echo ""
+        echo "## OS"
+        echo '```'
+        [ -f /etc/os-release ] && grep -E '^(NAME|VERSION)=' /etc/os-release || true
+        echo "Kernel: $(uname -r)"
+        echo '```'
+        echo ""
+        echo "## Network Interfaces"
+        echo '```'
+        ip -brief address show 2>/dev/null || ifconfig 2>/dev/null || echo "N/A"
+        echo '```'
+        echo ""
+        echo "## Installed Zabbix Packages"
+        echo '```'
+        rpm -qa 'zabbix*' 2>/dev/null | sort || dpkg -l 'zabbix*' 2>/dev/null || echo "N/A"
+        echo '```'
+        echo ""
+        echo "## Web Server / PHP"
+        echo '```'
+        apachectl -v 2>/dev/null || httpd -v 2>/dev/null || nginx -v 2>/dev/null || echo "N/A"
+        php -v 2>/dev/null | head -1 || echo "PHP: N/A"
+        echo '```'
+        echo ""
+        echo "## Database"
+        echo '```'
+        case $DBTYPE in
+            mysql) mysql --version 2>/dev/null || echo "N/A" ;;
+            psql)  psql  --version 2>/dev/null || echo "N/A" ;;
+        esac
+        echo '```'
+        echo ""
+        echo "## Zabbix Services"
+        echo '```'
+        systemctl list-units 'zabbix*' --no-pager 2>/dev/null || echo "N/A"
+        echo '```'
+        echo ""
+        echo "## Archives"
+        echo "| Archive | Paths |"
+        echo "|---------|-------|"
+        echo "| \`${CFG_BASE}_configs_zabbix${TAREXT}\`    | ${zbx_dirs[*]} |"
+        echo "| \`${CFG_BASE}_configs_webserver${TAREXT}\` | ${web_dirs[*]} |"
+        echo "| \`${CFG_BASE}_configs_database${TAREXT}\` | ${db_dirs[*]} |"
+        echo ""
+        echo "## Restore"
+        echo '```bash'
+        echo "tar -xf ${CFG_BASE}_configs_zabbix${TAREXT}   -C /"
+        echo "tar -xf ${CFG_BASE}_configs_webserver${TAREXT} -C /"
+        echo "tar -xf ${CFG_BASE}_configs_database${TAREXT}  -C /"
+        echo '```'
+    } > "$DUMPDIR/${CFG_BASE}_manifest.md"
+
+    if [ "$QUIET" == "no" ]; then
+        echo "  $DUMPDIR/${CFG_BASE}_configs_zabbix${TAREXT}"
+        echo "  $DUMPDIR/${CFG_BASE}_configs_webserver${TAREXT}"
+        echo "  $DUMPDIR/${CFG_BASE}_configs_database${TAREXT}"
+        echo "  $DUMPDIR/${CFG_BASE}_manifest.md"
+    fi
+
+    # Rotate config archives independently (each type keeps GENERATIONSTOKEEP copies)
+    if [ $GENERATIONSTOKEEP -gt 0 ]; then
+        for pat in "*_configs_zabbix.*" "*_configs_webserver.*" \
+                   "*_configs_database.*" "*_manifest.md"; do
+            ( cd "$DUMPDIR" && ls -t ${pat} 2>/dev/null \
+                | /usr/bin/awk "NR>${GENERATIONSTOKEEP}" \
+                | xargs rm -f 2>/dev/null ) || true
+        done
+    fi
+fi
+
+#
+# ROTATE OLD BACKUPS (DB dump only)
 #
 if [ $GENERATIONSTOKEEP -gt 0 ] && [ "$DUMPDIR" != "-" ]; then
     [ "$QUIET" == "no" ] && echo "Removing old backups, keeping up to $GENERATIONSTOKEEP"
-    REMOVE_OLD_CMD="cd \"$DUMPDIR\" && ls -t \"${DUMPFILENAME_PREFIX}\"* | /usr/bin/awk \"NR>${GENERATIONSTOKEEP}\" | xargs rm -f "
+    REMOVE_OLD_CMD="cd \"$DUMPDIR\" && ls -t \"${DUMPFILENAME_PREFIX}\"*.sql* | /usr/bin/awk \"NR>${GENERATIONSTOKEEP}\" | xargs rm -f "
     eval ${REMOVE_OLD_CMD}
     if [ $? -ne 0 ]; then
         echo "ERROR: Could not rotate old backups" >&2
