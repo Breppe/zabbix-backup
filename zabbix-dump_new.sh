@@ -43,6 +43,17 @@
 # LICENSE
 #     This script is released under the MIT License (see LICENSE.txt)
 
+# Some notes/todo
+#
+# I do not like to much to have the HANDLE_UNKWOWN and the database stored in two different files divided
+# in data and schema. (i've to study more about how to recover from disaster with data splitted,
+# maybe foreign key disablig i enough.)
+#
+# Furthermore i do not like the approach to split the variables and get a common state
+# and passing arguments via GLOBAL variables, i do not like it at all, maybe i will review the structure.
+#
+# TODO Review the use of 'log' and 'quiet = no' around the code
+
 VERSION=0.11.0
 
 # Absolute path to this script (BASH_SOURCE[0], not [*] which joins the stack).
@@ -61,7 +72,7 @@ DEFAULT_DBHOST="127.0.0.1"
 DEFAULT_DBSCHEMA="public"
 DEFAULT_DBNAME="zabbix"
 DEFAULT_DBUSER="zabbix"
-DEFAULT_DBPASS=""
+EFAULT_DBPASS=""
 COMPRESSION="gz"
 QUIET="no"
 REVERSELOOKUP="yes" # TODO check if functionality realli needed or in case delete
@@ -319,6 +330,7 @@ resolve_config() {
     [ -z "$DBNAME" ] && die "Please specify a database name (option -d)"
 }
 
+
 # Resolve and prepare the staging/output directory.
 #   - default $DEFAULT_STAGING_DIR, which must NOT already exist
 #   - -o DIR overrides it and lifts the "must not exist" restriction
@@ -382,6 +394,9 @@ restart_zabbix_server() {
 # =============================================================================
 #  DB OPTION ASSEMBLY
 # =============================================================================
+
+# TODO the function can be improved deduplicationg the same variables. 
+
 build_db_opts() {
     DB_OPTS=()
     case $DBTYPE in
@@ -392,9 +407,13 @@ build_db_opts() {
             [ -n "$DBUSER" ]   && DB_OPTS+=(-u "$DBUSER")
             [ -n "$DBPASS" ]   && DB_OPTS+=(-p"$DBPASS")
             DB_OPTS+=(-P"$DBPORT")
+
+            # Dividing options from mysql and mysqldump executable
+
             DB_OPTS_BATCH=("${DB_OPTS[@]}" --batch --silent)
             [ -n "$DBNAME" ] && DB_OPTS_BATCH+=(-D "$DBNAME")
-	    # TODO check what do following lines and also is if is better to prepare the 
+	    
+            # TODO check what do following lines and also is if is better to prepare the 
 	    # db dump options here.
             [ "$COLUMN_NAMES" == "yes" ] && DB_OPTS+=(--complete-insert --quote-names)
             ;;
@@ -483,8 +502,8 @@ check_unknown_tables() {
     UNKNOWN_TABLES=()
     local table
     while read -r table; do
-        elementIn "$table" "${KNOWN_TABLES[@]}" || UNKNOWN_TABLES+=("$table")
-    done <<<"$DB_TABLES"
+        elementIn "$table" "${KNOWN_TABLES[@]}" || UNKNOWN_TABLES+=("$table");
+    done <<< "$DB_TABLES"
 
     [ ${#UNKNOWN_TABLES[@]} -eq 0 ] && return 0
 
@@ -503,6 +522,7 @@ check_unknown_tables() {
 }
 
 # Build the "_db-mysql-X.Y.Z" version suffix from the dbversion table.
+# and save in $VERSION_SUFFIX
 resolve_db_version() {
     VERSION_SUFFIX=""
     local db_ver
@@ -615,6 +635,7 @@ print_config_summary() {
 #  DATABASE DUMP
 # =============================================================================
 
+# TODO Those names need to be passed for relative function as arguments
 # Names shared by every artifact of this run.
 init_run_names() {
     RUN_TS="$(date +%Y%m%d-%H%M)"
@@ -639,6 +660,9 @@ dump_mysql() {
             elementIn "$table" "${UNKNOWN_TABLES[@]}" && opts+=(--ignore-table="$DBNAME.$table")
         done <<<"$DB_TABLES"
     fi
+    
+    # TODO check if emit is valid or can be removed
+    # TODO add a print here before the start.
     emit truncate mysqldump "${DB_OPTS[@]}" "${opts[@]}" "$DBNAME" \
         || err_dump "table schemas"
 
@@ -745,6 +769,8 @@ backup_filesystem_configs() {
     for d in "${CFG_DIRS[@]}"; do
         [ -d "$d" ] && present_dirs+=("$d")
     done
+
+    # NOTE good approach it keep spaces avoiding to duplicate the object.
 
     log $'\nBacking up filesystem configs (single archive)...'
     if [ ${#present_dirs[@]} -gt 0 ]; then
@@ -905,8 +931,11 @@ main() {
     # Generate the variable $UNKOWN_TABLES
     check_unknown_tables
 
+    # Build the "_db-mysql-X.Y.Z" version suffix from the dbversion table.
+    # and save in $VERSION_SUFFIX
     resolve_db_version
     
+    # Initialize the variables with names and location
     init_run_names
 
     backup_database
